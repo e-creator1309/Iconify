@@ -1,7 +1,6 @@
 name: Build Release APK
 
 on:
-  push: 
   workflow_dispatch:
     inputs:
       split_apks:
@@ -166,7 +165,7 @@ jobs:
           path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
-      - name: Package ZIP (arm64 APK + ModuleBase)
+      - name: Package ZIP (APK Only)
         run: |
           set -e
           ZIP_NAME="Iconify v${{ env.VERSION_NAME }}.zip"
@@ -174,7 +173,7 @@ jobs:
           APK_DIR="app/build/outputs/apk"
           mkdir -p "$RELEASE_DIR/temp"
           
-          # البحث عن ملف APK الخاضع للـ arm64-v8a أو أول ملف APK متاح
+          # البحث عن ملف APK المخصص لمعمارية arm64-v8a أو أول ملف APK متاح
           FOUND_APK=$(find "$APK_DIR" -type f -name "*arm64-v8a*.apk" | head -n 1)
           if [ -z "$FOUND_APK" ]; then
             FOUND_APK=$(find "$APK_DIR" -type f -name "*.apk" | head -n 1)
@@ -187,8 +186,6 @@ jobs:
             exit 1
           fi
 
-          cp -r ModuleBase/* "$RELEASE_DIR/temp/"
-          sed -i 's/PKGNAME="\$BASEPKGNAME\.debug"/PKGNAME="\$BASEPKGNAME"/' "$RELEASE_DIR/temp/customize.sh" || true
           cd "$RELEASE_DIR/temp"
           zip -r "../$ZIP_NAME" .
           cd ../..
@@ -200,4 +197,3 @@ jobs:
           name: "Iconify Release v${{ env.VERSION_NAME }} (ZIP)"
           path: releases/*.zip
           if-no-files-found: error
-
