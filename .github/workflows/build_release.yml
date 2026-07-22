@@ -45,8 +45,8 @@ jobs:
           if [ -n "$EXISTING_KS" ]; then
             echo "missing=false" >> $GITHUB_OUTPUT
           else
-            echo "missing=true"  >> $GITHUB_OUTPUT
-            echo "::notice::No KEYSTORE secret found — will generate one now and save it for future builds."
+            echo "missing=true" >> $GITHUB_OUTPUT
+            echo "::notice::No KEYSTORE secret found — generating one now and saving for future builds."
           fi
         env:
           EXISTING_KS: ${{ secrets.KEYSTORE }}
@@ -66,28 +66,28 @@ jobs:
             -keysize 4096 \
             -validity 36500 \
             -storepass "$PASS" \
-            -keypass  "$PASS" \
+            -keypass "$PASS" \
             -dname "CN=Iconify, OU=Release, O=Iconify, L=Global, ST=Global, C=US"
 
           B64=$(base64 -w 0 "$JKS")
 
           echo "::add-mask::$PASS"
           echo "::add-mask::$B64"
-          echo "b64=$B64"     >> $GITHUB_OUTPUT
-          echo "pass=$PASS"   >> $GITHUB_OUTPUT
+          echo "b64=$B64" >> $GITHUB_OUTPUT
+          echo "pass=$PASS" >> $GITHUB_OUTPUT
           echo "alias=$ALIAS" >> $GITHUB_OUTPUT
 
-          # Stash locally for the write-keystore step below
-          echo "$B64"   > /tmp/ks.b64
-          echo "$PASS"  > /tmp/ks.pass
+          # Stash to files for the signing step
+          echo "$B64" > /tmp/ks.b64
+          echo "$PASS" > /tmp/ks.pass
           echo "$ALIAS" > /tmp/ks.alias
 
       - name: Save generated keystore to repo secrets (first run only)
         if: steps.check_ks.outputs.missing == 'true'
         env:
-          GH_PAT:   ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
-          KS_B64:   ${{ steps.gen_ks.outputs.b64 }}
-          KS_PASS:  ${{ steps.gen_ks.outputs.pass }}
+          GH_PAT: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
+          KS_B64: ${{ steps.gen_ks.outputs.b64 }}
+          KS_PASS: ${{ steps.gen_ks.outputs.pass }}
           KS_ALIAS: ${{ steps.gen_ks.outputs.alias }}
         run: |
           pip install --quiet PyNaCl
@@ -97,7 +97,7 @@ jobs:
           from nacl import encoding, public
 
           token = os.environ["GH_PAT"]
-          repo  = "${{ github.repository }}"
+          repo  = os.environ["GITHUB_REPOSITORY"]
           headers = {
               "Authorization": f"token {token}",
               "User-Agent":    "iconify-keystore-bot",
@@ -115,7 +115,7 @@ jobs:
           key_id     = pk_data["key_id"]
           pk_bytes   = base64.b64decode(pk_data["key"])
 
-          def encrypt(value: str) -> str:
+          def encrypt(value):
               pk  = public.PublicKey(pk_bytes, encoding.RawEncoder)
               box = public.SealedBox(pk)
               return base64.b64encode(box.encrypt(value.encode())).decode()
@@ -130,13 +130,13 @@ jobs:
                   "encrypted_value": encrypt(value),
                   "key_id":          key_id,
               })
-              print(f"{'✅' if status in (201,204) else '❌'} {name} → HTTP {status}")
+              print(f"{'OK' if status in (201,204) else 'FAIL'} {name} -> HTTP {status}")
+
+          print("All signing secrets saved.")
           PYEOF
 
-      # ── Write keystore.properties (works for both new and existing) ───────────
       - name: Write keystore file for signing
         run: |
-          # Use generated values if first run, otherwise use stored secrets
           if [ -f /tmp/ks.b64 ]; then
             KS_B64=$(cat /tmp/ks.b64)
             KS_PASS=$(cat /tmp/ks.pass)
@@ -156,13 +156,13 @@ jobs:
             echo "keyPassword=${KS_PASS}"
           } > keystore.properties
 
-      # ── Build ──────────────────────────────────────────────────────────────────
-      - name: Build Release APK (per-ABI split — smaller size)
-        if: ${{ github.event.inputs.split_apks == 'true' }}
+      # ── Build ─────────────────────────────────────────────────────────────────
+      - name: Build Release APK (per-ABI split)
+        if: github.event.inputs.split_apks == 'true'
         run: ./gradlew assembleRelease -PsplitApks
 
       - name: Build Release APK (universal)
-        if: ${{ github.event.inputs.split_apks != 'true' }}
+        if: github.event.inputs.split_apks != 'true'
         run: ./gradlew assembleRelease
 
       - name: Upload raw APKs
@@ -182,14 +182,12 @@ jobs:
 
           mkdir -p "$RELEASE_DIR/temp"
 
-          # Prefer arm64-v8a (smallest + most common); fall back to universal
           if ls "$APK_DIR"/*arm64-v8a*.apk 2>/dev/null | grep -q .; then
             cp "$APK_DIR"/*arm64-v8a*.apk "$RELEASE_DIR/temp/Iconify.apk"
           else
             cp "$APK_DIR"/*.apk "$RELEASE_DIR/temp/Iconify.apk"
           fi
 
-          # Copy ModuleBase; fix package name from .debug to release
           cp -r ModuleBase/* "$RELEASE_DIR/temp/"
           sed -i 's/PKGNAME="\$BASEPKGNAME\.debug"/PKGNAME="\$BASEPKGNAME"/' "$RELEASE_DIR/temp/customize.sh" || true
 
