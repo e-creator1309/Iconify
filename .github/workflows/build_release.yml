@@ -35,8 +35,14 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Accept NDK and SDK licenses
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
       - name: Get application version name
-        run: echo "VERSION_NAME=$(${GITHUB_WORKSPACE}/gradlew -q printVersionName)" >> $GITHUB_ENV
+        run: |
+          VERSION=$(./gradlew -q printVersionName 2>/dev/null | tail -1)
+          echo "VERSION_NAME=$VERSION" >> $GITHUB_ENV
 
       # ── Keystore: auto-generate if missing, otherwise reuse existing ──────────
       - name: Check if signing keystore is saved
