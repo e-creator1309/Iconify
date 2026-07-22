@@ -274,7 +274,7 @@ public abstract class ApkSignerV2 {
      * @param segments  raw bytes of each APK section (beforeCentralDir, centralDir, eocd)
      * @return the final content digest, or {@code null} on allocation failure
      */
-    private static native byte[] nativeComputeContentDigest(int algorithm, byte[][] segments)
+    private static native byte[] nativeComputeContentDigest(int algorithm, byte[][] segments);
 
     private static int getChunkCount(int inputSize, int chunkSize) {
         return (inputSize + chunkSize - 1) / chunkSize;
