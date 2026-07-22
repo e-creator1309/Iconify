@@ -10,7 +10,7 @@ on:
       branch:
         description: 'Branch to build from'
         type: string
-        default: 'beta'
+        default: 'Ui'
 
 jobs:
   build:
