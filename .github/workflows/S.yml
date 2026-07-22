@@ -1,0 +1,210 @@
+name: Build Release APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      split_apks:
+        description: 'Build per-ABI APKs (smaller, recommended)'
+        type: boolean
+        default: true
+      branch:
+        description: 'Branch to build from'
+        type: string
+        default: 'beta'
+
+jobs:
+  build:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Accept NDK and SDK licenses
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Get application version name
+        run: |
+          VERSION=$(./gradlew -q printVersionName 2>/dev/null | tail -1)
+          echo "VERSION_NAME=$VERSION" >> $GITHUB_ENV
+
+      # ── Keystore: auto-generate if missing, otherwise reuse existing ──────────
+      - name: Check if signing keystore is saved
+        id: check_ks
+        run: |
+          if [ -n "$EXISTING_KS" ]; then
+            echo "missing=false" >> $GITHUB_OUTPUT
+          else
+            echo "missing=true" >> $GITHUB_OUTPUT
+            echo "::notice::No KEYSTORE secret found — generating one now and saving for future builds."
+          fi
+        env:
+          EXISTING_KS: ${{ secrets.KEYSTORE }}
+
+      - name: Generate keystore (first run only)
+        if: steps.check_ks.outputs.missing == 'true'
+        id: gen_ks
+        run: |
+          PASS=$(openssl rand -hex 12)
+          ALIAS="iconify"
+          JKS="iconify-release.jks"
+
+          keytool -genkey -v \
+            -keystore "$JKS" \
+            -alias "$ALIAS" \
+            -keyalg RSA \
+            -keysize 4096 \
+            -validity 36500 \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -dname "CN=Iconify, OU=Release, O=Iconify, L=Global, ST=Global, C=US"
+
+          B64=$(base64 -w 0 "$JKS")
+
+          echo "::add-mask::$PASS"
+          echo "::add-mask::$B64"
+          echo "b64=$B64" >> $GITHUB_OUTPUT
+          echo "pass=$PASS" >> $GITHUB_OUTPUT
+          echo "alias=$ALIAS" >> $GITHUB_OUTPUT
+
+          # Stash to files for the signing step
+          echo "$B64" > /tmp/ks.b64
+          echo "$PASS" > /tmp/ks.pass
+          echo "$ALIAS" > /tmp/ks.alias
+
+      - name: Save generated keystore to repo secrets (first run only)
+        if: steps.check_ks.outputs.missing == 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          KS_B64: ${{ steps.gen_ks.outputs.b64 }}
+          KS_PASS: ${{ steps.gen_ks.outputs.pass }}
+          KS_ALIAS: ${{ steps.gen_ks.outputs.alias }}
+        run: |
+          pip install --quiet PyNaCl
+
+          python3 << 'PYEOF'
+          import os, base64, json, urllib.request
+          from nacl import encoding, public
+
+          token = os.environ["GH_PAT"]
+          repo  = os.environ["GITHUB_REPOSITORY"]
+          headers = {
+              "Authorization": f"token {token}",
+              "User-Agent":    "iconify-keystore-bot",
+              "Content-Type":  "application/json",
+          }
+
+          def gh(method, path, body=None):
+              url  = f"https://api.github.com{path}"
+              data = json.dumps(body).encode() if body else None
+              req  = urllib.request.Request(url, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read()), r.status
+
+          pk_data, _ = gh("GET", f"/repos/{repo}/actions/secrets/public-key")
+          key_id     = pk_data["key_id"]
+          pk_bytes   = base64.b64decode(pk_data["key"])
+
+          def encrypt(value):
+              pk  = public.PublicKey(pk_bytes, encoding.RawEncoder)
+              box = public.SealedBox(pk)
+              return base64.b64encode(box.encrypt(value.encode())).decode()
+
+          for name, value in {
+              "KEYSTORE":          os.environ["KS_B64"],
+              "KEYSTORE_PASSWORD": os.environ["KS_PASS"],
+              "KEY_ALIAS":         os.environ["KS_ALIAS"],
+              "KEY_PASSWORD":      os.environ["KS_PASS"],
+          }.items():
+              _, status = gh("PUT", f"/repos/{repo}/actions/secrets/{name}", {
+                  "encrypted_value": encrypt(value),
+                  "key_id":          key_id,
+              })
+              print(f"{'OK' if status in (201,204) else 'FAIL'} {name} -> HTTP {status}")
+
+          print("All signing secrets saved.")
+          PYEOF
+
+      - name: Write keystore file for signing
+        run: |
+          if [ -f /tmp/ks.b64 ]; then
+            KS_B64=$(cat /tmp/ks.b64)
+            KS_PASS=$(cat /tmp/ks.pass)
+            KS_ALIAS=$(cat /tmp/ks.alias)
+          else
+            KS_B64="${{ secrets.KEYSTORE }}"
+            KS_PASS="${{ secrets.KEYSTORE_PASSWORD }}"
+            KS_ALIAS="${{ secrets.KEY_ALIAS }}"
+          fi
+
+          echo "$KS_B64" | base64 --decode > "${{ github.workspace }}/key.jks"
+
+          {
+            echo "storeFile=${{ github.workspace }}/key.jks"
+            echo "storePassword=${KS_PASS}"
+            echo "keyAlias=${KS_ALIAS}"
+            echo "keyPassword=${KS_PASS}"
+          } > keystore.properties
+
+      # ── Build ─────────────────────────────────────────────────────────────────
+      - name: Build Release APK (per-ABI split)
+        if: github.event.inputs.split_apks == 'true'
+        run: ./gradlew assembleRelease -PsplitApks
+
+      - name: Build Release APK (universal)
+        if: github.event.inputs.split_apks != 'true'
+        run: ./gradlew assembleRelease
+
+      - name: Upload raw APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: "Iconify Release v${{ env.VERSION_NAME }} (APKs)"
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Package ZIP (arm64 APK + ModuleBase)
+        run: |
+          set -e
+
+          ZIP_NAME="Iconify v${{ env.VERSION_NAME }}.zip"
+          RELEASE_DIR="releases"
+          APK_DIR="app/build/outputs/apk/release"
+
+          mkdir -p "$RELEASE_DIR/temp"
+
+          if ls "$APK_DIR"/*arm64-v8a*.apk 2>/dev/null | grep -q .; then
+            cp "$APK_DIR"/*arm64-v8a*.apk "$RELEASE_DIR/temp/Iconify.apk"
+          else
+            cp "$APK_DIR"/*.apk "$RELEASE_DIR/temp/Iconify.apk"
+          fi
+
+          cp -r ModuleBase/* "$RELEASE_DIR/temp/"
+          sed -i 's/PKGNAME="\$BASEPKGNAME\.debug"/PKGNAME="\$BASEPKGNAME"/' "$RELEASE_DIR/temp/customize.sh" || true
+
+          cd "$RELEASE_DIR/temp"
+          zip -r "../$ZIP_NAME" .
+          cd ../..
+          rm -rf "$RELEASE_DIR/temp"
+
+      - name: Upload Release ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: "Iconify Release v${{ env.VERSION_NAME }} (ZIP)"
+          path: releases/*.zip
+          if-no-files-found: error
