@@ -40,10 +40,6 @@ android {
         multiDexEnabled = true
         buildConfigField("int", "MIN_SDK_VERSION", "$minSdk")
         buildConfigField("int", "OVERLAY_VERSION_CODE", "5")
-
-        ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-        }
     }
 
     val keystorePropertiesFile = rootProject.file("keystore.properties")
