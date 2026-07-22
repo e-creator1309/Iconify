@@ -1,0 +1,113 @@
+name: Generate & Save Signing Keystore
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate:
+    name: Generate JKS and push to repo secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check if keystore already saved
+        id: check
+        run: |
+          if [ -n "$EXISTING" ]; then
+            echo "already_set=true" >> $GITHUB_OUTPUT
+            echo "KEYSTORE secret is already set. Delete it first if you want to regenerate."
+          else
+            echo "already_set=false" >> $GITHUB_OUTPUT
+            echo "No existing keystore found — will generate a fresh one."
+          fi
+        env:
+          EXISTING: ${{ secrets.KEYSTORE }}
+
+      - name: Set up JDK 21 (for keytool)
+        if: steps.check.outputs.already_set == 'false'
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Generate keystore + random credentials
+        if: steps.check.outputs.already_set == 'false'
+        id: gen
+        run: |
+          PASS=$(openssl rand -hex 12)
+          ALIAS="iconify"
+          JKS="iconify-release.jks"
+
+          keytool -genkey -v \
+            -keystore "$JKS" \
+            -alias "$ALIAS" \
+            -keyalg RSA \
+            -keysize 4096 \
+            -validity 36500 \
+            -storepass "$PASS" \
+            -keypass "$PASS" \
+            -dname "CN=Iconify, OU=Release, O=Iconify, L=Global, ST=Global, C=US"
+
+          keytool -list -v -keystore "$JKS" -storepass "$PASS" | grep -E "Alias|Valid|SHA"
+
+          B64=$(base64 -w 0 "$JKS")
+
+          echo "::add-mask::$PASS"
+          echo "::add-mask::$B64"
+          echo "ks_b64=$B64" >> $GITHUB_OUTPUT
+          echo "ks_pass=$PASS" >> $GITHUB_OUTPUT
+          echo "ks_alias=$ALIAS" >> $GITHUB_OUTPUT
+
+      - name: Push secrets to this repo via API
+        if: steps.check.outputs.already_set == 'false'
+        env:
+          GH_PAT: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
+          KS_B64: ${{ steps.gen.outputs.ks_b64 }}
+          KS_PASS: ${{ steps.gen.outputs.ks_pass }}
+          KS_ALIAS: ${{ steps.gen.outputs.ks_alias }}
+        run: |
+          pip install --quiet PyNaCl
+
+          python3 << 'PYEOF'
+          import os, base64, json, urllib.request
+          from nacl import encoding, public
+
+          token = os.environ["GH_PAT"]
+          repo  = os.environ["GITHUB_REPOSITORY"]
+          headers = {
+              "Authorization": f"token {token}",
+              "User-Agent":    "iconify-keystore-bot",
+              "Content-Type":  "application/json",
+          }
+
+          def gh(method, path, body=None):
+              url  = f"https://api.github.com{path}"
+              data = json.dumps(body).encode() if body else None
+              req  = urllib.request.Request(url, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read()), r.status
+
+          pk_data, _ = gh("GET", f"/repos/{repo}/actions/secrets/public-key")
+          key_id     = pk_data["key_id"]
+          pk_bytes   = base64.b64decode(pk_data["key"])
+
+          def encrypt(value):
+              pk  = public.PublicKey(pk_bytes, encoding.RawEncoder)
+              box = public.SealedBox(pk)
+              return base64.b64encode(box.encrypt(value.encode())).decode()
+
+          for name, value in {
+              "KEYSTORE":          os.environ["KS_B64"],
+              "KEYSTORE_PASSWORD": os.environ["KS_PASS"],
+              "KEY_ALIAS":         os.environ["KS_ALIAS"],
+              "KEY_PASSWORD":      os.environ["KS_PASS"],
+          }.items():
+              _, status = gh("PUT", f"/repos/{repo}/actions/secrets/{name}", {
+                  "encrypted_value": encrypt(value),
+                  "key_id":          key_id,
+              })
+              print(f"{'OK' if status in (201,204) else 'FAIL'} {name} -> HTTP {status}")
+
+          print("All signing secrets saved.")
+          PYEOF
