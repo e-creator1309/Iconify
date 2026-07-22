@@ -85,7 +85,7 @@ jobs:
       - name: Save generated keystore to repo secrets (first run only)
         if: steps.check_ks.outputs.missing == 'true'
         env:
-          GH_PAT: ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           KS_B64: ${{ steps.gen_ks.outputs.b64 }}
           KS_PASS: ${{ steps.gen_ks.outputs.pass }}
           KS_ALIAS: ${{ steps.gen_ks.outputs.alias }}
