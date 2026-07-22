@@ -16,6 +16,8 @@ jobs:
   build:
     name: Build Release APK
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -36,15 +38,125 @@ jobs:
       - name: Get application version name
         run: echo "VERSION_NAME=$(${GITHUB_WORKSPACE}/gradlew -q printVersionName)" >> $GITHUB_ENV
 
-      - name: Write keystore
-        if: ${{ secrets.KEYSTORE != '' }}
+      # ── Keystore: auto-generate if missing, otherwise reuse existing ──────────
+      - name: Check if signing keystore is saved
+        id: check_ks
         run: |
-          echo storePassword='${{ secrets.KEYSTORE_PASSWORD }}' >> keystore.properties
-          echo keyAlias='${{ secrets.KEY_ALIAS }}'             >> keystore.properties
-          echo keyPassword='${{ secrets.KEY_PASSWORD }}'       >> keystore.properties
-          echo storeFile='${{ github.workspace }}/key.jks'     >> keystore.properties
-          echo ${{ secrets.KEYSTORE }} | base64 --decode > ${{ github.workspace }}/key.jks
+          if [ -n "$EXISTING_KS" ]; then
+            echo "missing=false" >> $GITHUB_OUTPUT
+          else
+            echo "missing=true"  >> $GITHUB_OUTPUT
+            echo "::notice::No KEYSTORE secret found — will generate one now and save it for future builds."
+          fi
+        env:
+          EXISTING_KS: ${{ secrets.KEYSTORE }}
 
+      - name: Generate keystore (first run only)
+        if: steps.check_ks.outputs.missing == 'true'
+        id: gen_ks
+        run: |
+          PASS=$(openssl rand -hex 12)
+          ALIAS="iconify"
+          JKS="iconify-release.jks"
+
+          keytool -genkey -v \
+            -keystore "$JKS" \
+            -alias "$ALIAS" \
+            -keyalg RSA \
+            -keysize 4096 \
+            -validity 36500 \
+            -storepass "$PASS" \
+            -keypass  "$PASS" \
+            -dname "CN=Iconify, OU=Release, O=Iconify, L=Global, ST=Global, C=US"
+
+          B64=$(base64 -w 0 "$JKS")
+
+          echo "::add-mask::$PASS"
+          echo "::add-mask::$B64"
+          echo "b64=$B64"     >> $GITHUB_OUTPUT
+          echo "pass=$PASS"   >> $GITHUB_OUTPUT
+          echo "alias=$ALIAS" >> $GITHUB_OUTPUT
+
+          # Stash locally for the write-keystore step below
+          echo "$B64"   > /tmp/ks.b64
+          echo "$PASS"  > /tmp/ks.pass
+          echo "$ALIAS" > /tmp/ks.alias
+
+      - name: Save generated keystore to repo secrets (first run only)
+        if: steps.check_ks.outputs.missing == 'true'
+        env:
+          GH_PAT:   ${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN }}
+          KS_B64:   ${{ steps.gen_ks.outputs.b64 }}
+          KS_PASS:  ${{ steps.gen_ks.outputs.pass }}
+          KS_ALIAS: ${{ steps.gen_ks.outputs.alias }}
+        run: |
+          pip install --quiet PyNaCl
+
+          python3 << 'PYEOF'
+          import os, base64, json, urllib.request
+          from nacl import encoding, public
+
+          token = os.environ["GH_PAT"]
+          repo  = "${{ github.repository }}"
+          headers = {
+              "Authorization": f"token {token}",
+              "User-Agent":    "iconify-keystore-bot",
+              "Content-Type":  "application/json",
+          }
+
+          def gh(method, path, body=None):
+              url  = f"https://api.github.com{path}"
+              data = json.dumps(body).encode() if body else None
+              req  = urllib.request.Request(url, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read()), r.status
+
+          pk_data, _ = gh("GET", f"/repos/{repo}/actions/secrets/public-key")
+          key_id     = pk_data["key_id"]
+          pk_bytes   = base64.b64decode(pk_data["key"])
+
+          def encrypt(value: str) -> str:
+              pk  = public.PublicKey(pk_bytes, encoding.RawEncoder)
+              box = public.SealedBox(pk)
+              return base64.b64encode(box.encrypt(value.encode())).decode()
+
+          for name, value in {
+              "KEYSTORE":          os.environ["KS_B64"],
+              "KEYSTORE_PASSWORD": os.environ["KS_PASS"],
+              "KEY_ALIAS":         os.environ["KS_ALIAS"],
+              "KEY_PASSWORD":      os.environ["KS_PASS"],
+          }.items():
+              _, status = gh("PUT", f"/repos/{repo}/actions/secrets/{name}", {
+                  "encrypted_value": encrypt(value),
+                  "key_id":          key_id,
+              })
+              print(f"{'✅' if status in (201,204) else '❌'} {name} → HTTP {status}")
+          PYEOF
+
+      # ── Write keystore.properties (works for both new and existing) ───────────
+      - name: Write keystore file for signing
+        run: |
+          # Use generated values if first run, otherwise use stored secrets
+          if [ -f /tmp/ks.b64 ]; then
+            KS_B64=$(cat /tmp/ks.b64)
+            KS_PASS=$(cat /tmp/ks.pass)
+            KS_ALIAS=$(cat /tmp/ks.alias)
+          else
+            KS_B64="${{ secrets.KEYSTORE }}"
+            KS_PASS="${{ secrets.KEYSTORE_PASSWORD }}"
+            KS_ALIAS="${{ secrets.KEY_ALIAS }}"
+          fi
+
+          echo "$KS_B64" | base64 --decode > "${{ github.workspace }}/key.jks"
+
+          {
+            echo "storeFile=${{ github.workspace }}/key.jks"
+            echo "storePassword=${KS_PASS}"
+            echo "keyAlias=${KS_ALIAS}"
+            echo "keyPassword=${KS_PASS}"
+          } > keystore.properties
+
+      # ── Build ──────────────────────────────────────────────────────────────────
       - name: Build Release APK (per-ABI split — smaller size)
         if: ${{ github.event.inputs.split_apks == 'true' }}
         run: ./gradlew assembleRelease -PsplitApks
@@ -70,14 +182,14 @@ jobs:
 
           mkdir -p "$RELEASE_DIR/temp"
 
-          # Prefer arm64-v8a for the Magisk module (smallest + most common ABI)
+          # Prefer arm64-v8a (smallest + most common); fall back to universal
           if ls "$APK_DIR"/*arm64-v8a*.apk 2>/dev/null | grep -q .; then
             cp "$APK_DIR"/*arm64-v8a*.apk "$RELEASE_DIR/temp/Iconify.apk"
           else
             cp "$APK_DIR"/*.apk "$RELEASE_DIR/temp/Iconify.apk"
           fi
 
-          # Copy ModuleBase and fix package name to release ID (no .debug suffix)
+          # Copy ModuleBase; fix package name from .debug to release
           cp -r ModuleBase/* "$RELEASE_DIR/temp/"
           sed -i 's/PKGNAME="\$BASEPKGNAME\.debug"/PKGNAME="\$BASEPKGNAME"/' "$RELEASE_DIR/temp/customize.sh" || true
 
