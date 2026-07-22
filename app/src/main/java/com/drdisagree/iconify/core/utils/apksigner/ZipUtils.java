@@ -10,6 +10,8 @@ import java.nio.ByteOrder;
  * order of these buffers is little-endian.</p>
  *
  * <p>Source: <a href="https://github.com/topjohnwu/Magisk/blob/master/app/src/main/java/com/topjohnwu/magisk/signing/ZipUtils.java">...</a></p>
+ *
+ * <p>The inner scan loop ({@link #nativeFindEocd}) is implemented in C (NDK) for speed.</p>
  */
 public abstract class ZipUtils {
 
@@ -24,6 +26,10 @@ public abstract class ZipUtils {
 
     private static final int UINT16_MAX_VALUE = 0xffff;
 
+    static {
+        System.loadLibrary("iconify-native");
+    }
+
     private ZipUtils() {
     }
 
@@ -36,33 +42,24 @@ public abstract class ZipUtils {
     public static int findZipEndOfCentralDirectoryRecord(ByteBuffer zipContents) {
         assertByteOrderLittleEndian(zipContents);
 
-        // ZIP End of Central Directory (EOCD) record is located at the very end of the ZIP archive.
-        // The record can be identified by its 4-byte signature/magic which is located at the very
-        // beginning of the record. A complication is that the record is variable-length because of
-        // the comment field.
-        // The algorithm for locating the ZIP EOCD record is as follows. We search backwards from
-        // end of the buffer for the EOCD record signature. Whenever we find a signature, we check
-        // the candidate record's comment length is such that the remainder of the record takes up
-        // exactly the remaining bytes in the buffer. The search is bounded because the maximum
-        // size of the comment field is 65535 bytes because the field is an unsigned 16-bit number.
-
-        int archiveSize = zipContents.capacity();
-        if (archiveSize < ZIP_EOCD_REC_MIN_SIZE) {
+        int capacity = zipContents.capacity();
+        if (capacity < ZIP_EOCD_REC_MIN_SIZE) {
             return -1;
         }
-        int maxCommentLength = Math.min(archiveSize - ZIP_EOCD_REC_MIN_SIZE, UINT16_MAX_VALUE);
-        int eocdWithEmptyCommentStartPosition = archiveSize - ZIP_EOCD_REC_MIN_SIZE;
-        for (int expectedCommentLength = 0; expectedCommentLength < maxCommentLength; expectedCommentLength++) {
-            int eocdStartPos = eocdWithEmptyCommentStartPosition - expectedCommentLength;
-            if (zipContents.getInt(eocdStartPos) == ZIP_EOCD_REC_SIG) {
-                int actualCommentLength = getUnsignedInt16(zipContents, eocdStartPos + ZIP_EOCD_COMMENT_LENGTH_FIELD_OFFSET);
-                if (actualCommentLength == expectedCommentLength) {
-                    return eocdStartPos;
-                }
-            }
+
+        // Extract raw bytes without modifying the buffer's position/limit.
+        byte[] arr;
+        if (zipContents.hasArray()) {
+            arr = zipContents.array();
+        } else {
+            // Direct (off-heap) buffer — copy to a heap array for the native call.
+            ByteBuffer dup = zipContents.duplicate();
+            dup.position(0).limit(capacity);
+            arr = new byte[capacity];
+            dup.get(arr);
         }
 
-        return -1;
+        return nativeFindEocd(arr, capacity);
     }
 
     /**
@@ -135,4 +132,15 @@ public abstract class ZipUtils {
         }
         buffer.putInt(buffer.position() + offset, (int) value);
     }
+
+    // ── Native methods ────────────────────────────────────────────────────────
+
+    /**
+     * Native (C) implementation of the backwards EOCD-signature scan.
+     *
+     * @param data  raw bytes of the ZIP archive
+     * @param size  number of bytes to consider (== {@code data.length})
+     * @return offset of the EOCD record, or -1
+     */
+    private static native int nativeFindEocd(byte[] data, int size);
 }

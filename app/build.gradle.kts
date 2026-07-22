@@ -16,6 +16,15 @@ plugins {
 android {
     namespace = "com.drdisagree.iconify"
 
+    ndkVersion = "27.2.12479018"
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     compileSdk {
         version = release(37) {
             minorApiLevel = 0
@@ -31,6 +40,10 @@ android {
         multiDexEnabled = true
         buildConfigField("int", "MIN_SDK_VERSION", "$minSdk")
         buildConfigField("int", "OVERLAY_VERSION_CODE", "5")
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+        }
     }
 
     val keystorePropertiesFile = rootProject.file("keystore.properties")

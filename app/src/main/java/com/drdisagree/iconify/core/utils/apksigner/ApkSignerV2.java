@@ -85,6 +85,10 @@ public abstract class ApkSignerV2 {
             };
     private static final int APK_SIGNATURE_SCHEME_V2_BLOCK_ID = 0x7109871a;
 
+    static {
+        System.loadLibrary("iconify-native");
+    }
+
     private ApkSignerV2() {
     }
 
@@ -230,95 +234,47 @@ public abstract class ApkSignerV2 {
         };
     }
 
+    /**
+     * Computes APK v2 content digests for all requested algorithms.
+     *
+     * <p>Delegates to the native C implementation which processes each 1 MB chunk
+     * using a bundled SHA-256/SHA-512 implementation, avoiding per-chunk
+     * {@link MessageDigest#getInstance} overhead and JVM ByteBuffer tracking.</p>
+     */
     private static Map<Integer, byte[]> computeContentDigests(
             Set<Integer> digestAlgorithms,
             ByteBuffer[] contents) throws DigestException {
-        // For each digest algorithm the result is computed as follows:
-        // 1. Each segment of contents is split into consecutive chunks of 1 MB in size.
-        //    The final chunk will be shorter iff the length of segment is not a multiple of 1 MB.
-        //    No chunks are produced for empty (zero length) segments.
-        // 2. The digest of each chunk is computed over the concatenation of byte 0xa5, the chunk's
-        //    length in bytes (uint32 little-endian) and the chunk's contents.
-        // 3. The output digest is computed over the concatenation of the byte 0x5a, the number of
-        //    chunks (uint32 little-endian) and the concatenation of digests of chunks of all
-        //    segments in-order.
 
-        int chunkCount = 0;
-        for (ByteBuffer input : contents) {
-            chunkCount += getChunkCount(input.remaining(), CONTENT_DIGESTED_CHUNK_MAX_SIZE_BYTES);
-        }
-
-        final Map<Integer, byte[]> digestsOfChunks = new HashMap<>(digestAlgorithms.size());
-        for (int digestAlgorithm : digestAlgorithms) {
-            int digestOutputSizeBytes = getContentDigestAlgorithmOutputSizeBytes(digestAlgorithm);
-            byte[] concatenationOfChunkCountAndChunkDigests =
-                    new byte[5 + chunkCount * digestOutputSizeBytes];
-            concatenationOfChunkCountAndChunkDigests[0] = 0x5a;
-            setUnsignedInt32LittleEngian(
-                    chunkCount, concatenationOfChunkCountAndChunkDigests, 1);
-            digestsOfChunks.put(digestAlgorithm, concatenationOfChunkCountAndChunkDigests);
-        }
-
-        int chunkIndex = 0;
-        byte[] chunkContentPrefix = new byte[5];
-        chunkContentPrefix[0] = (byte) 0xa5;
-        // Optimization opportunity: digests of chunks can be computed in parallel.
-        for (ByteBuffer input : contents) {
-            while (input.hasRemaining()) {
-                int chunkSize =
-                        Math.min(input.remaining(), CONTENT_DIGESTED_CHUNK_MAX_SIZE_BYTES);
-                final ByteBuffer chunk = getByteBuffer(input, chunkSize);
-                for (int digestAlgorithm : digestAlgorithms) {
-                    String jcaAlgorithmName =
-                            getContentDigestAlgorithmJcaDigestAlgorithm(digestAlgorithm);
-                    MessageDigest md;
-                    try {
-                        md = MessageDigest.getInstance(jcaAlgorithmName);
-                    } catch (NoSuchAlgorithmException e) {
-                        throw new DigestException(
-                                jcaAlgorithmName + " MessageDigest not supported", e);
-                    }
-                    // Reset position to 0 and limit to capacity. Position would've been modified
-                    // by the preceding iteration of this loop. NOTE: Contrary to the method name,
-                    // this does not modify the contents of the chunk.
-                    chunk.clear();
-                    setUnsignedInt32LittleEngian(chunk.remaining(), chunkContentPrefix, 1);
-                    md.update(chunkContentPrefix);
-                    md.update(chunk);
-                    byte[] concatenationOfChunkCountAndChunkDigests =
-                            digestsOfChunks.get(digestAlgorithm);
-                    int expectedDigestSizeBytes =
-                            getContentDigestAlgorithmOutputSizeBytes(digestAlgorithm);
-                    int actualDigestSizeBytes =
-                            md.digest(
-                                    concatenationOfChunkCountAndChunkDigests,
-                                    5 + chunkIndex * expectedDigestSizeBytes,
-                                    expectedDigestSizeBytes);
-                    if (actualDigestSizeBytes != expectedDigestSizeBytes) {
-                        throw new DigestException(
-                                "Unexpected output size of " + md.getAlgorithm()
-                                        + " digest: " + actualDigestSizeBytes);
-                    }
-                }
-                chunkIndex++;
-            }
+        // Snapshot each ByteBuffer as a byte[] without altering its position/limit.
+        byte[][] segments = new byte[contents.length][];
+        for (int i = 0; i < contents.length; i++) {
+            ByteBuffer buf = contents[i];
+            ByteBuffer dup = buf.duplicate();
+            dup.clear();
+            segments[i] = new byte[dup.remaining()];
+            dup.get(segments[i]);
         }
 
         Map<Integer, byte[]> result = new HashMap<>(digestAlgorithms.size());
-        for (Map.Entry<Integer, byte[]> entry : digestsOfChunks.entrySet()) {
-            int digestAlgorithm = entry.getKey();
-            byte[] concatenationOfChunkCountAndChunkDigests = entry.getValue();
-            String jcaAlgorithmName = getContentDigestAlgorithmJcaDigestAlgorithm(digestAlgorithm);
-            MessageDigest md;
-            try {
-                md = MessageDigest.getInstance(jcaAlgorithmName);
-            } catch (NoSuchAlgorithmException e) {
-                throw new DigestException(jcaAlgorithmName + " MessageDigest not supported", e);
+        for (int algo : digestAlgorithms) {
+            byte[] digest = nativeComputeContentDigest(algo, segments);
+            if (digest == null) {
+                throw new DigestException(
+                        "Native content digest failed for algorithm " + algo);
             }
-            result.put(digestAlgorithm, md.digest(concatenationOfChunkCountAndChunkDigests));
+            result.put(algo, digest);
         }
         return result;
     }
+
+    /**
+     * Native (C) APK v2 content-digest computation.
+     *
+     * @param algorithm 0 = SHA-256 (32-byte result), 1 = SHA-512 (64-byte result)
+     * @param segments  raw bytes of each APK section (beforeCentralDir, centralDir, eocd)
+     * @return the final content digest, or {@code null} on allocation failure
+     */
+    private static native byte[] nativeComputeContentDigest(int algorithm, byte[][] segments)
 
     private static int getChunkCount(int inputSize, int chunkSize) {
         return (inputSize + chunkSize - 1) / chunkSize;
