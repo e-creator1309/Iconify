@@ -1,6 +1,7 @@
 name: Build Release APK
 
 on:
+  push: 
   workflow_dispatch:
     inputs:
       split_apks:
@@ -23,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ inputs.branch || github.ref }}
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -64,7 +65,6 @@ jobs:
           PASS=$(openssl rand -hex 12)
           ALIAS="iconify"
           JKS="iconify-release.jks"
-
           keytool -genkey -v \
             -keystore "$JKS" \
             -alias "$ALIAS" \
@@ -74,15 +74,12 @@ jobs:
             -storepass "$PASS" \
             -keypass "$PASS" \
             -dname "CN=Iconify, OU=Release, O=Iconify, L=Global, ST=Global, C=US"
-
           B64=$(base64 -w 0 "$JKS")
-
           echo "::add-mask::$PASS"
           echo "::add-mask::$B64"
           echo "b64=$B64" >> $GITHUB_OUTPUT
           echo "pass=$PASS" >> $GITHUB_OUTPUT
           echo "alias=$ALIAS" >> $GITHUB_OUTPUT
-
           # Stash to files for the signing step
           echo "$B64" > /tmp/ks.b64
           echo "$PASS" > /tmp/ks.pass
@@ -97,11 +94,9 @@ jobs:
           KS_ALIAS: ${{ steps.gen_ks.outputs.alias }}
         run: |
           pip install --quiet PyNaCl
-
           python3 << 'PYEOF'
           import os, base64, json, urllib.request
           from nacl import encoding, public
-
           token = os.environ["GH_PAT"]
           repo  = os.environ["GITHUB_REPOSITORY"]
           headers = {
@@ -109,23 +104,19 @@ jobs:
               "User-Agent":    "iconify-keystore-bot",
               "Content-Type":  "application/json",
           }
-
           def gh(method, path, body=None):
               url  = f"https://api.github.com{path}"
               data = json.dumps(body).encode() if body else None
               req  = urllib.request.Request(url, data=data, method=method, headers=headers)
               with urllib.request.urlopen(req) as r:
                   return json.loads(r.read()), r.status
-
           pk_data, _ = gh("GET", f"/repos/{repo}/actions/secrets/public-key")
           key_id     = pk_data["key_id"]
           pk_bytes   = base64.b64decode(pk_data["key"])
-
           def encrypt(value):
               pk  = public.PublicKey(pk_bytes, encoding.RawEncoder)
               box = public.SealedBox(pk)
               return base64.b64encode(box.encrypt(value.encode())).decode()
-
           for name, value in {
               "KEYSTORE":          os.environ["KS_B64"],
               "KEYSTORE_PASSWORD": os.environ["KS_PASS"],
@@ -137,7 +128,6 @@ jobs:
                   "key_id":          key_id,
               })
               print(f"{'OK' if status in (201,204) else 'FAIL'} {name} -> HTTP {status}")
-
           print("All signing secrets saved.")
           PYEOF
 
@@ -152,50 +142,48 @@ jobs:
             KS_PASS="${{ secrets.KEYSTORE_PASSWORD }}"
             KS_ALIAS="${{ secrets.KEY_ALIAS }}"
           fi
-
           echo "$KS_B64" | base64 --decode > "${{ github.workspace }}/key.jks"
-
           {
             echo "storeFile=${{ github.workspace }}/key.jks"
             echo "storePassword=${KS_PASS}"
             echo "keyAlias=${KS_ALIAS}"
             echo "keyPassword=${KS_PASS}"
-          } > keystore.properties
+          } | tee keystore.properties app/keystore.properties
 
       # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build Release APK (per-ABI split)
-        if: github.event.inputs.split_apks == 'true'
+        if: ${{ inputs.split_apks }}
         run: ./gradlew assembleRelease -PsplitApks
 
       - name: Build Release APK (universal)
-        if: github.event.inputs.split_apks != 'true'
+        if: ${{ !inputs.split_apks }}
         run: ./gradlew assembleRelease
 
       - name: Upload raw APKs
         uses: actions/upload-artifact@v4
         with:
           name: "Iconify Release v${{ env.VERSION_NAME }} (APKs)"
-          path: app/build/outputs/apk/release/*.apk
+          path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
-      - name: Package ZIP (arm64 APK + ModuleBase)
+      - name: Package ZIP (arm64 APK Only)
         run: |
           set -e
-
           ZIP_NAME="Iconify v${{ env.VERSION_NAME }}.zip"
           RELEASE_DIR="releases"
-          APK_DIR="app/build/outputs/apk/release"
-
+          APK_DIR="app/build/outputs/apk"
           mkdir -p "$RELEASE_DIR/temp"
-
-          if ls "$APK_DIR"/*arm64-v8a*.apk 2>/dev/null | grep -q .; then
-            cp "$APK_DIR"/*arm64-v8a*.apk "$RELEASE_DIR/temp/Iconify.apk"
+          
+          # البحث حصرياً عن ملف arm64-v8a المخصص للمعمارية المستهدفة
+          FOUND_APK=$(find "$APK_DIR" -type f -name "*arm64-v8a*.apk" | head -n 1)
+          
+          if [ -n "$FOUND_APK" ]; then
+            echo "Found arm64 APK: $FOUND_APK"
+            cp "$FOUND_APK" "$RELEASE_DIR/temp/Iconify.apk"
           else
-            cp "$APK_DIR"/*.apk "$RELEASE_DIR/temp/Iconify.apk"
+            echo "Error: arm64-v8a APK not found in $APK_DIR"
+            exit 1
           fi
-
-          cp -r ModuleBase/* "$RELEASE_DIR/temp/"
-          sed -i 's/PKGNAME="\$BASEPKGNAME\.debug"/PKGNAME="\$BASEPKGNAME"/' "$RELEASE_DIR/temp/customize.sh" || true
 
           cd "$RELEASE_DIR/temp"
           zip -r "../$ZIP_NAME" .
